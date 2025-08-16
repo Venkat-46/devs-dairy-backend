@@ -4,39 +4,10 @@ GET http://localhost:3001/date
 
 GET http://localhost:3001/users
 
+################
+
 GET http://localhost:3001/logs/1
 
-#########
-
+##################
 Send Request
-POST http://localhost:3001/userlog/1
-Content-Type: application/json
-
-{
-  "date": "13-10-2001",
-  "yesterday": "attended the exam",
-  "today": "had a meeting",
-  "blocker": "No"
-}
-
-
 POST http://localhost:3001/logs/1/1
-Content-Type: application/json
-
-{
-  "date": "13-10-2001",
-  "yesterday": "attended the exam",
-  "today": "had a meeting",
-  "blocker": "No"
-}
-
-
-POST http://localhost:3001/userlogs/1
-Content-Type: application/json
-
-{
-  "date": "13-10-20012",
-  "yesterday": "attended the exam",
-  "today": "had a meeting",
-  "blocker": "yes"
-}
