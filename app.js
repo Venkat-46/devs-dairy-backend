@@ -1,19 +1,21 @@
-const express = require('express')
-const {open} = require('sqlite')
-const sqlite3 = require('sqlite3')
-const path = require('path')
+require('dotenv').config();
+const express = require('express');
+const { createClient } = require('@libsql/client');
 const cors = require('cors');
-const bcrypt = require('bcrypt')
-const jwt = require('jsonwebtoken')
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 
-const databasePath = path.join(__dirname, 'devdb.db')
+const db = createClient({
+  url: process.env.TURSO_DATABASE_URL,
+  authToken: process.env.TURSO_AUTH_TOKEN,
+});
 
-
-const app = express()
+const app = express();
 
 app.use(cors());
-app.use(express.json())
+app.use(express.json());
 
+// Error handlers
 process.on("uncaughtException", (err) => {
   console.error("Uncaught Exception:", err);
 });
@@ -22,251 +24,214 @@ process.on("unhandledRejection", (reason, promise) => {
   console.error("Unhandled Rejection:", reason);
 });
 
+// --- Helper function ---
+const convertUser = row => ({
+  userId: row.id,
+  userName: row.username,
+  email: row.email,
+});
 
-let database = null
-
-const initializeDbAndServer = async () => {
+// --- Signup API ---
+app.post('/signup', async (req, res) => {
   try {
-    database = await open({
-      filename: databasePath,
-      driver: sqlite3.Database,
-    })
+    const { username, email, password, role } = req.body;
 
-    app.listen(3001, () =>
-      console.log('Server Running at http://localhost:3001/'),
-    )
-  } catch (error) {
-    console.log(`DB Error: ${error.message}`)
-    process.exit(1)
-  }
-}
+    const existingUser = await db.execute({
+      sql: "SELECT * FROM users WHERE email = ?",
+      args: [email],
+    });
 
-initializeDbAndServer()
-
-const convertStateDbObjectToResponseObject = dbObject => {
-  return {
-    userId: dbObject.id,
-    userName: dbObject.username,
-    email: dbObject.email,
-  }
-}
-
-
-
-
-app.post('/signup', async (request, response) => {
-  try {
-    const { username, email, password, role  } = request.body;
-
-    const existingUser = await database.get(
-      `SELECT * FROM users WHERE email = ?`,
-      [email]
-    );
-
-    if (existingUser) {
-      return response.status(400).send("Email already registered");
+    if (existingUser.rows.length > 0) {
+      return res.status(400).send("Email already registered");
     }
 
-    const postUsersQuery = `
-      INSERT INTO users (username, email, password, role )
-      VALUES (?, ?, ?, ?);
-    `;
+    const hashedPassword = await bcrypt.hash(password, 10);
 
-    await database.run(postUsersQuery, [
-      username, email, password, role 
-    ]);
+    await db.execute({
+      sql: "INSERT INTO users (username, email, password, role) VALUES (?, ?, ?, ?)",
+      args: [username, email, hashedPassword, role],
+    });
 
-    response.status(201).json({ message: "User successfully added" });
+    res.status(201).json({ message: "User successfully added" });
   } catch (error) {
     console.error(error);
-    response.status(500).json({ message: "Error adding user" }); 
+    res.status(500).json({ message: "Error adding user" });
   }
 });
 
-
-
-app.post('/login/', async (request, response) => {
-  const {username, password, role} = request.body
-  const selectUserQuery = `SELECT * FROM users WHERE username = '${username}';`
-  const databaseUser = await database.get(selectUserQuery)
-  if (databaseUser === undefined) {
-    response.status(400)
-    response.send('Invalid user')
-  } else {
-    const isPasswordMatched = password===databaseUser.password;
-    if (databaseUser.role===role){
-      if (isPasswordMatched === true) {
-      const payload = {
-        username: username,
-      }
-      const jwtToken = jwt.sign(payload, 'MY_SECRET_TOKEN')
-      response.send({jwtToken,userid:databaseUser.id})
-    } else {
-      response.status(400)
-      response.send('Invalid password')
-    }
-    }else{
-      response.status(400)
-      response.send('Invalid role')
-    }
-  }
-})
-
-
-
-app.get('/users/', async (request, response) => {
-  const getStatesQuery = `
-    SELECT
-      *
-    FROM
-      users;`
-  const usersArray = await database.all(getStatesQuery)
-  response.send(
-    usersArray.map(each =>
-      convertStateDbObjectToResponseObject(each),
-    ),
-  )
-})
-
-app.get('/users/:userid', async (request, response) => {
+// --- Login API ---
+app.post('/login', async (req, res) => {
   try {
-    const { userid } = request.params;
+    const { username, password, role } = req.body;
 
-    if (isNaN(userid)) {
-      return response.status(400).send({ error: "Invalid user ID" });
+    const result = await db.execute({
+      sql: "SELECT * FROM users WHERE username = ?",
+      args: [username],
+    });
+
+    if (result.rows.length === 0) {
+      return res.status(400).send("Invalid user");
     }
 
-    const getUserQuery = `SELECT * FROM users WHERE id = ?;`;
+    const user = result.rows[0];
 
-    const user = await database.get(getUserQuery, [userid]);
+    const isPasswordMatched = await bcrypt.compare(password, user.password);
 
-    if (!user) {
-      return response.status(404).send({ error: "User not found" });
+    if (user.role !== role) {
+      return res.status(400).send("Invalid role");
     }
 
-    response.status(200).send(user);
+    if (!isPasswordMatched) {
+      return res.status(400).send("Invalid password");
+    }
+
+    const payload = { username: user.username };
+    const jwtToken = jwt.sign(payload, 'MY_SECRET_TOKEN');
+
+    res.json({ jwtToken, userid: user.id });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send("Error logging in");
+  }
+});
+
+// --- Get all users ---
+app.get('/users', async (req, res) => {
+  try {
+    const result = await db.execute("SELECT * FROM users");
+    res.json(result.rows.map(convertUser));
+  } catch (error) {
+    console.error(error);
+    res.status(500).send("Error fetching users");
+  }
+});
+
+// --- Get single user ---
+app.get('/users/:userid', async (req, res) => {
+  try {
+    const { userid } = req.params;
+
+    const result = await db.execute({
+      sql: "SELECT * FROM users WHERE id = ?",
+      args: [userid],
+    });
+
+    if (result.rows.length === 0) {
+      return res.status(404).send({ error: "User not found" });
+    }
+
+    res.json(result.rows[0]);
   } catch (error) {
     console.error("Error fetching user:", error);
-    response.status(500).send({ error: "Internal server error" });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-
-
-app.get('/userlogs/:userid', async (request, response) => {
-  const {userid}=request.params;
-  console.log("userid:",userid)
-  const getStatesQuery = `
-    SELECT
-      *
-    FROM
-      userlogs
-      where user_id=${userid};`
-  const logsArray = await database.all(getStatesQuery)
-  response.send(
-    logsArray)
-  
-})
-
-app.get('/userlogs/:userid/:logid', async (request, response) => {
+// --- Get logs for a user ---
+app.get('/userlogs/:userid', async (req, res) => {
   try {
-    const { userid, logid } = request.params;
-    console.log(userid,logid)
+    const { userid } = req.params;
 
-    const getLogQuery = `
-      SELECT *
-      FROM userlogs
-      WHERE user_id = ? AND id = ?;
-    `;
+    const result = await db.execute({
+      sql: "SELECT * FROM userlogs WHERE user_id = ?",
+      args: [userid],
+    });
 
-    const log = await database.get(getLogQuery, [userid, logid]);
+    res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send("Error fetching logs");
+  }
+});
 
-    if (!log) {
-      return response.status(404).send({ message: "Log not found" });
+// --- Get single log ---
+app.get('/userlogs/:userid/:logid', async (req, res) => {
+  try {
+    const { userid, logid } = req.params;
+
+    const result = await db.execute({
+      sql: "SELECT * FROM userlogs WHERE user_id = ? AND id = ?",
+      args: [userid, logid],
+    });
+
+    if (result.rows.length === 0) {
+      return res.status(404).send({ message: "Log not found" });
     }
 
-    response.send(log);
+    res.json(result.rows[0]);
   } catch (error) {
     console.error("Error fetching log:", error);
-    response.status(500).send({ message: "Error fetching log" });
+    res.status(500).send({ message: "Error fetching log" });
   }
 });
 
-app.post('/userlogs/:userid', async (request, response) => {
+// --- Add log ---
+app.post('/userlogs/:userid', async (req, res) => {
   try {
-    const { userid } = request.params;
-    const { date, yesterday, today, blocker } = request.body;
+    const { userid } = req.params;
+    const { date, yesterday, today, blocker } = req.body;
 
-    const postLogsQuery = `
-      INSERT INTO userlogs (user_id, date, yesterday, today, blocker)
-      VALUES (?, ?, ?, ?, ?);
-    `;
+    await db.execute({
+      sql: "INSERT INTO userlogs (user_id, date, yesterday, today, blocker) VALUES (?, ?, ?, ?, ?)",
+      args: [userid, date, yesterday, today, blocker],
+    });
 
-    await database.run(postLogsQuery, [
-      userid,
-      date,
-      yesterday,
-      today,
-      blocker
-    ]);
-
-    response.send('Log successfully added');
+    res.send("Log successfully added");
   } catch (error) {
     console.error(error);
-    response.status(500).send('Error adding log');
+    res.status(500).send("Error adding log");
   }
 });
 
-
-app.delete('/userlogs/delete/:userid/:logid', async (request, response) => {
+// --- Delete log ---
+app.delete('/userlogs/delete/:userid/:logid', async (req, res) => {
   try {
-    const { userid, logid } = request.params;
-    const deleteLogQuery = `
-      DELETE FROM userlogs
-      WHERE user_id = ? AND id = ?;
-    `;
+    const { userid, logid } = req.params;
 
-    const result = await database.run(deleteLogQuery, [userid, logid]);
+    const result = await db.execute({
+      sql: "DELETE FROM userlogs WHERE user_id = ? AND id = ?",
+      args: [userid, logid],
+    });
 
-    if (result.changes === 0) {
-      return response.status(404).json({ message: "Log not found" });
+    if (result.rowsAffected === 0) {
+      return res.status(404).json({ message: "Log not found" });
     }
 
-    response.status(200).json({ message: "Log successfully deleted" });
+    res.json({ message: "Log successfully deleted" });
   } catch (error) {
     console.error(error);
-    response.status(500).json({ message: "Error deleting log" });
+    res.status(500).json({ message: "Error deleting log" });
   }
 });
 
-
-app.post('/userlogs/update/:userid/:logid', async (request, response) => {
+// --- Update log ---
+app.post('/userlogs/update/:userid/:logid', async (req, res) => {
   try {
-    const { userid, logid } = request.params;
-    const { date, yesterday, today, blocker } = request.body;
+    const { userid, logid } = req.params;
+    const { date, yesterday, today, blocker } = req.body;
 
-    const updateLogsQuery = `
-      UPDATE userlogs
-      SET date = ?, yesterday = ?, today = ?, blocker = ?
-      WHERE user_id = ? AND id = ?;
-    `;
+    const result = await db.execute({
+      sql: `
+        UPDATE userlogs
+        SET date = ?, yesterday = ?, today = ?, blocker = ?
+        WHERE user_id = ? AND id = ?
+      `,
+      args: [date, yesterday, today, blocker, userid, logid],
+    });
 
-    await database.run(updateLogsQuery, [
-      date,
-      yesterday,
-      today,
-      blocker,
-      userid,
-      logid
-    ]);
+    if (result.rowsAffected === 0) {
+      return res.status(404).json({ message: "Log not found or not updated" });
+    }
 
-    response.json({ message: "Log is updated successfully" });
+    res.json({ message: "Log updated successfully" });
   } catch (error) {
     console.error(error);
-    response.status(500).send('Error updating log');
+    res.status(500).send("Error updating log");
   }
 });
 
+app.listen(3001, () =>
+  console.log("Server Running at http://localhost:3001/")
+);
 
-
-module.exports = app
+module.exports = app;
